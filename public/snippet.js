@@ -2,7 +2,7 @@
   const config = {
     endpoint: 'https://trackwebvital-957239900505.us-central1.run.app',
     errorEndpoint: 'https://trackwebvital-957239900505.us-central1.run.app/error',
-    snippetVersion: 'v2.1.0',
+    snippetVersion: 'v2.1.1',
     webVitalsScript: 'https://unpkg.com/web-vitals@3/dist/web-vitals.iife.js',
     debug: false
   };
@@ -29,19 +29,17 @@
         const r = Math.random() * 16 | 0;
         return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
       }));
+      sessionStorage.setItem('__sessionStart__', Date.now());
     }
     return sessionStorage.getItem('__sessionId__');
   }
 
   function getGA4SessionId() {
-    // Try GA4 cookie (_ga_<measurement-id>)
     const ga4Cookie = document.cookie.match(/_ga_([A-Z0-9]+)=GS1\.1\.([^;]+)/);
     if (ga4Cookie) {
       const sessionData = ga4Cookie[2].split('.');
       if (sessionData.length >= 2) return sessionData[1];
     }
-
-    // Try dataLayer (GTM or direct gtag.js)
     const dataLayer = window.dataLayer || [];
     for (let i = dataLayer.length - 1; i >= 0; i--) {
       const item = dataLayer[i];
@@ -49,20 +47,15 @@
         return item['ga4_session_id'];
       }
     }
-
-    // Try gtag.js global object
     if (window.google_tag_data?.tidr?.sid) {
       return window.google_tag_data.tidr.sid;
     }
-
-    // Try gtag.js config in dataLayer
     for (let i = dataLayer.length - 1; i >= 0; i--) {
       const item = dataLayer[i];
       if (item && item[0] === 'config' && item[1].startsWith('G-') && item[2]?.session_id) {
         return item[2].session_id;
       }
     }
-
     return 'unknown';
   }
 
@@ -112,6 +105,64 @@
     } catch {
       return { deviceModel: 'unknown', platformVersion: 'unknown' };
     }
+  }
+
+  function getConsentStatus() {
+    const dataLayer = window.dataLayer || [];
+    for (let i = dataLayer.length - 1; i >= 0; i--) {
+      const item = dataLayer[i];
+      if (item && item.event === 'consent' && item.analytics_storage) {
+        return item.analytics_storage;
+      }
+    }
+    return document.cookie.includes('cookie_consent=granted') ? 'granted' : 'denied';
+  }
+
+  function getConnectionSpeed() {
+    return navigator.connection?.downlink || 'unknown';
+  }
+
+  function getServerTiming() {
+    try {
+      const nav = performance.getEntriesByType('navigation')[0];
+      const serverTiming = nav.serverTiming || [];
+      return serverTiming.reduce((acc, timing) => {
+        acc[timing.name] = timing.duration;
+        return acc;
+      }, {});
+    } catch {
+      return {};
+    }
+  }
+
+  function getPageLoadTime() {
+    try {
+      const timing = performance.timing;
+      return timing.loadEventEnd - timing.navigationStart || 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  function getSessionDuration() {
+    const start = sessionStorage.getItem('__sessionStart__') || (sessionStorage.setItem('__sessionStart__', Date.now()), Date.now());
+    return Date.now() - parseInt(start);
+  }
+
+  function getEnvironment() {
+    const hostname = location.hostname;
+    if (hostname.includes('localhost') || hostname.includes('dev')) return 'development';
+    if (hostname.includes('staging')) return 'staging';
+    return 'production';
+  }
+
+  function getCustomDimensions() {
+    const dataLayer = window.dataLayer || [];
+    for (let i = dataLayer.length - 1; i >= 0; i--) {
+      const item = dataLayer[i];
+      if (item && item.custom) return item.custom;
+    }
+    return {};
   }
 
   function getSafeUrl() {
@@ -213,8 +264,31 @@
     }
   }
 
+  // ---------- Additional Metrics ----------
+  function getFirstInteractionTime() {
+    try {
+      const entries = performance.getEntriesByType('event');
+      const firstInteraction = entries.find(e => e.interactionId);
+      return firstInteraction ? { name: 'FirstInteraction', value: firstInteraction.startTime, delta: firstInteraction.startTime, rating: 'none', timestamp: Date.now() } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function trackScrollDepth() {
+    let maxScroll = 0;
+    window.addEventListener('scroll', () => {
+      const scrollPercent = Math.min(100, Math.round((window.scrollY / (document.documentElement.scrollHeight - window.innerHeight)) * 100));
+      if (scrollPercent > maxScroll) {
+        maxScroll = scrollPercent;
+        sendToServer({ name: 'ScrollDepth', value: scrollPercent, delta: scrollPercent, rating: 'none', timestamp: Date.now() });
+      }
+    }, { passive: true });
+  }
+
   // ---------- Send ----------
   async function sendToServer(metric) {
+    if (getConsentStatus() !== 'granted' || navigator.doNotTrack === '1') return;
     if (!metric || !metric.name || typeof metric.value !== 'number') {
       logErrorToServer(new Error(`Invalid metric data: ${JSON.stringify(metric)}`));
       return;
@@ -224,13 +298,18 @@
       name: metric.name,
       value: metric.value,
       delta: metric.delta,
-      rating: metric.rating,
+      rating: metric.rating || 'none',
       timestamp: Date.now()
     });
 
     if (!window.__vitalsBatchTimeout) {
       window.__vitalsBatchTimeout = setTimeout(async () => {
         if (window.__webVitalsTracker.metricsBatch.length === 0) return;
+        let attempts = 0;
+        while (getGA4SessionId() === 'unknown' && attempts < 20 && window.dataLayer) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+          attempts++;
+        }
         const uaInfo = parseUA();
         const clientHints = await getClientHints();
         const payload = {
@@ -252,6 +331,7 @@
           platform: isMobileDevice() ? 'mobile' : 'desktop',
           deviceCategory: getDeviceCategory(),
           connection: getConnectionType(),
+          connectionSpeed: getConnectionSpeed(),
           deviceMemory: getDeviceMemory(),
           hardwareConcurrency: getCPUCores(),
           documentVisibility: document.visibilityState,
@@ -260,7 +340,13 @@
           isFirstVisit: isFirstVisit(),
           pageType: getPageType(),
           userType: getUserType(),
-          clientHints: clientHints,
+          consentStatus: getConsentStatus(),
+          doNotTrack: navigator.doNotTrack === '1' ? true : false,
+          pageLoadTime: getPageLoadTime(),
+          sessionDuration: getSessionDuration(),
+          environment: getEnvironment(),
+          customDimensions: getCustomDimensions(),
+          serverTiming: getServerTiming(),
           metrics: window.__webVitalsTracker.metricsBatch,
           timestamp: Date.now()
         };
@@ -304,6 +390,7 @@
         platform: isMobileDevice() ? 'mobile' : 'desktop',
         deviceCategory: getDeviceCategory(),
         connection: getConnectionType(),
+        connectionSpeed: getConnectionSpeed(),
         deviceMemory: getDeviceMemory(),
         hardwareConcurrency: getCPUCores(),
         documentVisibility: document.visibilityState,
@@ -312,6 +399,13 @@
         isFirstVisit: isFirstVisit(),
         pageType: getPageType(),
         userType: getUserType(),
+        consentStatus: getConsentStatus(),
+        doNotTrack: navigator.doNotTrack === '1' ? true : false,
+        pageLoadTime: getPageLoadTime(),
+        sessionDuration: getSessionDuration(),
+        environment: getEnvironment(),
+        customDimensions: getCustomDimensions(),
+        serverTiming: getServerTiming(),
         clientHints: { deviceModel: 'unknown', platformVersion: 'unknown' },
         metrics: window.__webVitalsTracker.metricsBatch,
         timestamp: Date.now()
@@ -323,6 +417,13 @@
       }
     }
   });
+
+  // ---------- Initialize Additional Metrics ----------
+  document.addEventListener('click', () => {
+    const metric = getFirstInteractionTime();
+    if (metric) sendToServer(metric);
+  }, { once: true });
+  trackScrollDepth();
 
   // ---------- Load web-vitals ----------
   var s = document.createElement('script');
@@ -338,6 +439,8 @@
     webVitals.onCLS(sendToServer);
     webVitals.onINP(sendToServer);
     webVitals.onTTFB(sendToServer);
+    webVitals.onFCP(sendToServer);
+    // webVitals.onTBT(sendToServer); // Uncomment if supported
   };
   s.onerror = () => logErrorToServer(new Error('Error loading web-vitals script'));
   document.head.appendChild(s);
