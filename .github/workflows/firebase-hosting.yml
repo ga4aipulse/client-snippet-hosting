@@ -17,6 +17,6 @@ jobs:
         run: npm install -g firebase-tools
 
       - name: Deploy to Firebase
-        run: firebase deploy --only hosting
+        run: firebase deploy --only hosting --project mythical-height-451619-v9
         env:
           FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
